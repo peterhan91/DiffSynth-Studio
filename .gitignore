@@ -138,3 +138,4 @@ desktop.ini
 *.svg
 *.nii.gz
 *.mp4 
+examples/wanct/fetch_ct.ipynb
