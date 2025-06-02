@@ -28,9 +28,9 @@ def download_ct_rate_data(split='train', start_at=0, hf_token=None):
                 token=hf_token,
                 subfolder=hf_subfolder_path, 
                 filename=name,
-                cache_dir='./cache', 
-                local_dir='data', 
-                # local_dir_use_symlinks=False, # Deprecated and ignored
+                cache_dir='/cbica/projects/CXR/data/CT-RATE/cache', 
+                local_dir='/cbica/projects/CXR/data/CT-RATE/data', 
+                local_dir_use_symlinks=False, # Deprecated and ignored
                 resume_download=True,
             )
         except Exception as e:
