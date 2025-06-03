@@ -7,23 +7,287 @@ import numpy as np
 import os
 import traceback # Added for detailed error logging
 import random # Added for random sampling
+import nibabel as nib # Added for NIfTI file support
+import torch.nn.functional as F # Added for trilinear interpolation
 
 # --- Configuration --- 
-# !!! UPDATE THESE PATHS !!!
+# !!! UPDATE THESE PATHS AND SETTINGS !!!
 VAE_MODEL_PATH = "/home/than/.cache/huggingface/hub/models--Wan-AI--Wan2.1-T2V-1.3B/snapshots/37ec512624d61f7aa208f7ea8140a131f93afc9a/Wan2.1_VAE.pth" # CHOOSE YOUR VAE
-EXAMPLE_VIDEO_PATH = "examples/wanct/output/train_3_a_1_resampled_axis0.mp4"
+
+# --- Input Data: Choose NIFTI or VIDEO ---
+INPUT_TYPE = "NIFTI" # "NIFTI" or "VIDEO"
+
+# For NIFTI input
+NIFTI_FILE_PATHS = [
+    # Add paths to your NIfTI files here, e.g.:
+    # "/path/to/your/scan1.nii.gz",
+    # "/path/to/your/scan2.nii.gz",
+]
+SLICING_AXIS = 0 # Axis to slice along for the *final processed* NIfTI volume (0 for Depth/Z, 1 for Height/Y, 2 for Width/X).
+# After preprocessing, volume is (Depth, Height, Width) corresponding to (Z,Y,X) resampled axes.
+
+# NIFTI Preprocessing Parameters (adapted from nifty_mp4.py)
+TARGET_X_SPACING = 0.75
+TARGET_Y_SPACING = 0.75
+TARGET_Z_SPACING = 1.5
+NORMALIZED_BACKGROUND_PADDING_VALUE = -1.0 # Used for padding if data is in [-1,1] range
+
+# Target shape for NIfTI volumes after resampling (Depth, Height, Width).
+# Set to None to disable cropping/padding to a fixed shape.
+# Example: TARGET_SHAPE_DHW = (128, 256, 256)
+TARGET_SHAPE_DHW = None # (e.g., (160, 256, 256))
+
+# For VIDEO input (original script's setting)
+EXAMPLE_VIDEO_PATH = "examples/wanct/output/train_3_a_1_resampled_axis0.mp4" # Used if INPUT_TYPE is "VIDEO"
+
 OUTPUT_DIR_FOR_COMPARISON_IMAGES = "vae_reconstruction_test_output"
 
 # Device to run the VAE on
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # VAE input image size (consistent with train_wan_t2v.py defaults, adjust if necessary)
+# This is the size slices will be resized to before VAE.
 IMG_HEIGHT = 512
 IMG_WIDTH = 512
 
-# Number of frames to sample from the video for testing
-NUM_TEST_FRAMES = 5
+# Number of frames/slices to sample from the video/NIfTI volume for testing
+NUM_TEST_FRAMES_OR_SLICES = 5
 # --- End Configuration ---
+
+# --- Helper functions from nifty_mp4.py (adapted) ---
+def resize_volume_trilinear(volume_tensor, current_spacing, target_spacing):
+    """
+    Resize the 3D volume tensor to match the target spacing using trilinear interpolation.
+    volume_tensor: input tensor of shape (1, 1, D, H, W) or (D,H,W)
+    current_spacing: tuple of (spacing_dim0, spacing_dim1, spacing_dim2) for D, H, W respectively
+    target_spacing: tuple of (target_spacing_dim0, target_spacing_dim1, target_spacing_dim2) for D, H, W respectively
+    Returns: resampled numpy array of shape (D_new, H_new, W_new)
+    """
+    if volume_tensor.ndim == 3: # (D, H, W)
+        # Add batch and channel dimensions for F.interpolate
+        volume_tensor = volume_tensor.unsqueeze(0).unsqueeze(0) # (1, 1, D, H, W)
+    elif volume_tensor.ndim != 5 or volume_tensor.shape[0] != 1 or volume_tensor.shape[1] != 1:
+        raise ValueError("volume_tensor must be (D,H,W) or (1,1,D,H,W)")
+
+    original_shape_d_h_w = volume_tensor.shape[2:] # (D, H, W)
+    
+    scaling_factors = [
+        current_spacing[i] / target_spacing[i] for i in range(3)
+    ]
+    new_shape_d_h_w = [
+        int(original_shape_d_h_w[i] * scaling_factors[i]) for i in range(3)
+    ]
+    # Ensure new shape dimensions are at least 1 to avoid errors with F.interpolate
+    new_shape_d_h_w = [max(1, s) for s in new_shape_d_h_w]
+
+    resampled_tensor = F.interpolate(
+        volume_tensor.float(), # Ensure float for interpolation
+        size=new_shape_d_h_w, 
+        mode='trilinear', 
+        align_corners=False # Usually False for medical imaging
+    )
+    return resampled_tensor.squeeze().cpu().numpy() # Back to (D_new, H_new, W_new) numpy array
+
+def crop_or_pad_volume_to_target_shape(volume, target_shape_d_h_w, pad_value):
+    """
+    Crops or pads a 3D volume to a target shape (Depth, Height, Width).
+    Assumes volume is a NumPy array with shape (D, H, W).
+    Cropping is centered. Padding uses the specified pad_value.
+    """
+    current_shape = volume.shape
+    target_d, target_h, target_w = target_shape_d_h_w
+
+    # Calculate padding/cropping for depth (axis 0)
+    d_diff = target_d - current_shape[0]
+    d_pad_before = d_diff // 2 if d_diff > 0 else 0
+    d_pad_after = d_diff - d_pad_before if d_diff > 0 else 0
+    d_crop_start = -d_diff // 2 if d_diff < 0 else 0
+    d_crop_end = current_shape[0] - (-d_diff - d_crop_start) if d_diff < 0 else current_shape[0]
+
+    # Calculate padding/cropping for height (axis 1)
+    h_diff = target_h - current_shape[1]
+    h_pad_before = h_diff // 2 if h_diff > 0 else 0
+    h_pad_after = h_diff - h_pad_before if h_diff > 0 else 0
+    h_crop_start = -h_diff // 2 if h_diff < 0 else 0
+    h_crop_end = current_shape[1] - (-h_diff - h_crop_start) if h_diff < 0 else current_shape[1]
+
+    # Calculate padding/cropping for width (axis 2)
+    w_diff = target_w - current_shape[2]
+    w_pad_before = w_diff // 2 if w_diff > 0 else 0
+    w_pad_after = w_diff - w_pad_before if w_diff > 0 else 0
+    w_crop_start = -w_diff // 2 if w_diff < 0 else 0
+    w_crop_end = current_shape[2] - (-w_diff - w_crop_start) if w_diff < 0 else current_shape[2]
+
+    # Apply cropping first
+    cropped_volume = volume[d_crop_start:d_crop_end, h_crop_start:h_crop_end, w_crop_start:w_crop_end]
+
+    # Apply padding if needed
+    if d_diff > 0 or h_diff > 0 or w_diff > 0:
+        padded_volume = np.pad(
+            cropped_volume, 
+            ((d_pad_before, d_pad_after), (h_pad_before, h_pad_after), (w_pad_before, w_pad_after)),
+            mode='constant', 
+            constant_values=pad_value
+        )
+        return padded_volume
+    else:
+        return cropped_volume
+# --- End Helper functions ---
+
+class NiftiSliceDataset(torch.utils.data.Dataset):
+    def __init__(self, file_paths, num_slices_to_sample, 
+                 img_height_for_vae, img_width_for_vae, 
+                 slicing_axis_for_final_volume=0, 
+                 target_shape_dhw=None, 
+                 base_transform=None):
+        """
+        Args:
+            file_paths (list of str): List of paths to NIfTI files.
+            num_slices_to_sample (int): Number of slices to sample from each NIfTI volume.
+            img_height_for_vae (int): Target height for slices fed to VAE (after PIL resize).
+            img_width_for_vae (int): Target width for slices fed to VAE (after PIL resize).
+            slicing_axis_for_final_volume (int): Axis of the *final processed volume* to slice along (0:Depth, 1:Height, 2:Width).
+            target_shape_dhw (tuple or None): Target (D,H,W) for volume after resampling. If None, no cropping/padding.
+            base_transform (callable, optional): Transformations for VAE input (ToTensor, Normalize).
+        """
+        self.file_paths = file_paths
+        self.num_slices_to_sample = num_slices_to_sample
+        self.img_height_for_vae = img_height_for_vae
+        self.img_width_for_vae = img_width_for_vae
+        self.slicing_axis_for_final_volume = slicing_axis_for_final_volume
+        self.target_shape_dhw = target_shape_dhw
+        self.base_transform = base_transform
+
+        if self.base_transform is None:
+            self.base_transform = transforms.Compose([
+                transforms.ToTensor(), 
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+            ])
+
+    def __len__(self):
+        return len(self.file_paths)
+
+    def __getitem__(self, idx):
+        nifti_path = self.file_paths[idx]
+        
+        try:
+            img_nifti = nib.load(nifti_path)
+            data = img_nifti.get_fdata().astype(np.float32)
+
+            # 1. Apply slope and intercept if available
+            scl_slope, scl_inter = img_nifti.header.get_slope_inter()
+            if scl_slope is None: scl_slope = 1.0
+            if scl_inter is None: scl_inter = 0.0
+            if scl_slope != 0: # Avoid issues with slope being exactly 0
+                 data = data * scl_slope + scl_inter
+            else: # if slope is 0, it's likely an issue or a very specific case. Use intercept only.
+                 data = np.full_like(data, scl_inter)
+
+
+            # 2. HU Clipping
+            hu_min, hu_max = -1000, 1000
+            data_clipped = np.clip(data, hu_min, hu_max)
+
+            # 3. Normalize HU-clipped data to [-1.0, 1.0]
+            # (data - hu_min) / (hu_max - hu_min) maps to [0,1]
+            # then * 2.0 - 1.0 maps to [-1,1]
+            if (hu_max - hu_min) > 1e-5: # Avoid division by zero
+                volume_norm_minus1_to_1 = ((data_clipped - hu_min) / (hu_max - hu_min)) * 2.0 - 1.0
+            else: # If range is too small, set to mid-value (0 in [-1,1] scale) or padding value
+                volume_norm_minus1_to_1 = np.full_like(data_clipped, 0.0)
+
+
+            # 4. Transpose to (Depth, Height, Width) convention for resampling (e.g., Z, Y, X)
+            # NIfTI data is often (X, Y, Z). get_zooms() gives (x_zoom, y_zoom, z_zoom).
+            # We transpose to (Z, Y, X) to match target_spacing (TARGET_Z_SPACING, TARGET_Y_SPACING, TARGET_X_SPACING)
+            volume_transposed = volume_norm_minus1_to_1.transpose(2, 1, 0) # From (X,Y,Z) to (Z,Y,X)
+            
+            # Original spacings corresponding to (X,Y,Z)
+            x_zoom, y_zoom, z_zoom = img_nifti.header.get_zooms()
+            # Spacings for the transposed (Z,Y,X) volume
+            current_spacing_for_resample = (z_zoom, y_zoom, x_zoom)
+            target_spacing_for_resample = (TARGET_Z_SPACING, TARGET_Y_SPACING, TARGET_X_SPACING)
+
+            # 5. Resample to target spacing
+            volume_tensor_for_resample = torch.from_numpy(volume_transposed.copy()) # Ensure it's a new tensor for unsqueeze
+            resampled_volume = resize_volume_trilinear(
+                volume_tensor_for_resample, 
+                current_spacing_for_resample, 
+                target_spacing_for_resample
+            ) # Output is numpy array, still in [-1,1] range
+
+            # 6. Crop or Pad to Target Shape (if specified)
+            final_volume_processed_minus1_to_1 = resampled_volume
+            if self.target_shape_dhw is not None:
+                final_volume_processed_minus1_to_1 = crop_or_pad_volume_to_target_shape(
+                    resampled_volume, 
+                    self.target_shape_dhw, 
+                    NORMALIZED_BACKGROUND_PADDING_VALUE # Padding value is -1.0
+                )
+            
+            # 7. Convert final processed volume from [-1,1] to [0,1] for PIL conversion and subsequent transforms
+            final_volume_0_to_1 = (final_volume_processed_minus1_to_1 + 1.0) / 2.0
+
+        except Exception as e:
+            print(f"Error preprocessing NIfTI file {nifti_path}: {e}")
+            traceback.print_exc()
+            return None, None 
+
+        # Check dimensions after processing
+        if final_volume_0_to_1.ndim != 3:
+            print(f"Error: Processed NIfTI data for {nifti_path} is not 3D (shape: {final_volume_0_to_1.shape}). Skipping.")
+            return None, None
+
+        num_available_slices = final_volume_0_to_1.shape[self.slicing_axis_for_final_volume]
+
+        if num_available_slices == 0:
+            print(f"Error: Processed NIfTI {nifti_path} has 0 slices along axis {self.slicing_axis_for_final_volume}. Skipping.")
+            return None, None
+
+        slice_indices = []
+        if num_available_slices >= self.num_slices_to_sample:
+            # Ensure indices are spread out if possible, or just random sample
+            # For simplicity, using random.sample. For more even spread, use np.linspace then int.
+            slice_indices = sorted(random.sample(range(num_available_slices), self.num_slices_to_sample))
+        else:
+            slice_indices = sorted(random.choices(range(num_available_slices), k=self.num_slices_to_sample))
+            print(f"Warning: Requested {self.num_slices_to_sample} slices from processed {nifti_path} (axis {self.slicing_axis_for_final_volume} has {num_available_slices}). Sampling with replacement.")
+
+        processed_tensor_slices = []
+        display_pil_slices = []
+
+        for slice_idx in slice_indices:
+            if self.slicing_axis_for_final_volume == 0: # Depth (Z)
+                slice_np_0_to_1 = final_volume_0_to_1[slice_idx, :, :]
+            elif self.slicing_axis_for_final_volume == 1: # Height (Y)
+                slice_np_0_to_1 = final_volume_0_to_1[:, slice_idx, :]
+            elif self.slicing_axis_for_final_volume == 2: # Width (X)
+                slice_np_0_to_1 = final_volume_0_to_1[:, :, slice_idx]
+            else:
+                raise ValueError(f"Invalid slicing_axis_for_final_volume: {self.slicing_axis_for_final_volume}")
+
+            # Slice is in [0,1] float. Convert to uint8 [0,255] for PIL
+            slice_uint8 = (slice_np_0_to_1 * 255).astype(np.uint8)
+            
+            pil_img = Image.fromarray(slice_uint8, mode='L')
+            pil_img_rgb = pil_img.convert('RGB')
+
+            # Resize for VAE input and display
+            pil_resized_rgb = pil_img_rgb.resize((self.img_width_for_vae, self.img_height_for_vae), Image.BILINEAR)
+            
+            display_pil_slices.append(pil_resized_rgb)
+
+            # Apply base transformations (ToTensor, Normalize to [-1,1]) for VAE
+            tensor_slice = self.base_transform(pil_resized_rgb) # Expects PIL, outputs tensor normalized to [-1,1]
+            processed_tensor_slices.append(tensor_slice)
+        
+        if not processed_tensor_slices:
+            print(f"Error: No slices processed for {nifti_path}. This is unexpected.")
+            return None, None
+            
+        input_tensor = torch.stack(processed_tensor_slices) # (num_slices, C, H, W)
+        return input_tensor, display_pil_slices
+
 
 def load_vae(vae_path, device):
     print(f"Loading VAE from: {vae_path}")
@@ -260,25 +524,78 @@ def main():
         print("Exiting due to VAE loading failure.")
         return
 
-    original_frames_pil, input_tensor = load_and_preprocess_frames(
-        EXAMPLE_VIDEO_PATH, NUM_TEST_FRAMES, IMG_HEIGHT, IMG_WIDTH
-    )
-    if original_frames_pil is None or input_tensor is None:
-        print("Exiting due to frame loading or preprocessing failure.")
-        return
+    if INPUT_TYPE == "NIFTI":
+        if not NIFTI_FILE_PATHS:
+            print("ERROR: INPUT_TYPE is NIFTI, but NIFTI_FILE_PATHS is empty. Please provide NIfTI file paths.")
+            return
+        
+        print(f"Processing NIfTI files from: {NIFTI_FILE_PATHS}")
+        print(f"NIfTI settings: Target Spacing (Z,Y,X): ({TARGET_Z_SPACING},{TARGET_Y_SPACING},{TARGET_X_SPACING}), Target Shape (D,H,W): {TARGET_SHAPE_DHW}, Slicing Axis for final volume: {SLICING_AXIS}")
 
-    reconstructed_tensor = reconstruct_frames(vae, input_tensor, device)
-    if reconstructed_tensor is None:
-        print("Exiting due to reconstruction failure.")
-        return
+        dataset = NiftiSliceDataset(
+            file_paths=NIFTI_FILE_PATHS,
+            num_slices_to_sample=NUM_TEST_FRAMES_OR_SLICES,
+            img_height_for_vae=IMG_HEIGHT,
+            img_width_for_vae=IMG_WIDTH,
+            slicing_axis_for_final_volume=SLICING_AXIS,
+            target_shape_dhw=TARGET_SHAPE_DHW
+            # base_transform is defaulted in the class
+        )
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0) # num_workers=0 for easier debugging
 
-    reconstructed_frames_pil = tensor_to_pil_images(reconstructed_tensor)
+        for i, data_batch in enumerate(dataloader):
+            # Check if dataset __getitem__ returned None due to error
+            if data_batch[0] is None or data_batch[1] is None: 
+                original_nifti_path = dataset.file_paths[i] # Get path using index if dataloader preserves order
+                print(f"Skipping NIfTI file (originally {original_nifti_path} at index {i}) due to loading/preprocessing error in dataset.")
+                continue
+            
+            input_tensor_item, original_frames_pil_item_list = data_batch
+            
+            input_tensor = input_tensor_item.squeeze(0) 
+            original_frames_pil = original_frames_pil_item_list[0] 
+
+            current_nifti_path = dataset.file_paths[i] # Get path based on current index in dataloader
+            nifti_filename_base = os.path.basename(current_nifti_path)
+            nifti_filename_stem = os.path.splitext(os.path.splitext(nifti_filename_base)[0])[0] 
+            
+            output_dir_for_file = os.path.join(OUTPUT_DIR_FOR_COMPARISON_IMAGES, f"nifti_{nifti_filename_stem}")
+            print(f"Processing NIfTI file: {current_nifti_path} (Outputting to: {output_dir_for_file})")
+
+            reconstructed_tensor = reconstruct_frames(vae, input_tensor, device)
+            if reconstructed_tensor is None:
+                print(f"Reconstruction failed for {current_nifti_path}. Skipping.")
+                continue
+
+            reconstructed_frames_pil = tensor_to_pil_images(reconstructed_tensor)
+            save_comparison_images(original_frames_pil, reconstructed_frames_pil, output_dir_for_file)
+            print(f"Finished processing {current_nifti_path}. Check results in {output_dir_for_file}")
+
+    elif INPUT_TYPE == "VIDEO":
+        print(f"Processing Video file: {EXAMPLE_VIDEO_PATH}")
+        original_frames_pil, input_tensor = load_and_preprocess_frames(
+            EXAMPLE_VIDEO_PATH, NUM_TEST_FRAMES_OR_SLICES, IMG_HEIGHT, IMG_WIDTH
+        )
+        if original_frames_pil is None or input_tensor is None:
+            print("Exiting due to frame loading or preprocessing failure.")
+            return
+
+        output_dir_for_video = os.path.join(OUTPUT_DIR_FOR_COMPARISON_IMAGES, "video_reconstruction")
+        reconstructed_tensor = reconstruct_frames(vae, input_tensor, device)
+        if reconstructed_tensor is None:
+            print("Exiting due to reconstruction failure.")
+            return
+
+        reconstructed_frames_pil = tensor_to_pil_images(reconstructed_tensor)
+        save_comparison_images(original_frames_pil, reconstructed_frames_pil, output_dir_for_video)
+        print(f"Finished processing video. Check results in {output_dir_for_video}")
+
+    else:
+        print(f"ERROR: Unknown INPUT_TYPE: {INPUT_TYPE}. Choose 'NIFTI' or 'VIDEO'.")
+        return
     
-    save_comparison_images(original_frames_pil, reconstructed_frames_pil, OUTPUT_DIR_FOR_COMPARISON_IMAGES)
-    
-    print("VAE Reconstruction Test Finished.")
-    print("Please check the images in the '{OUTPUT_DIR_FOR_COMPARISON_IMAGES}' directory to assess reconstruction quality.")
-    print("If reconstructions are poor (blurry, loss of detail), the VAE likely needs finetuning for your CT data.")
+    print("VAE Reconstruction Test Finished for all inputs.")
+    print(f"Please check the images in the subdirectories of '{OUTPUT_DIR_FOR_COMPARISON_IMAGES}' to assess reconstruction quality.")
 
 if __name__ == "__main__":
     main() 
